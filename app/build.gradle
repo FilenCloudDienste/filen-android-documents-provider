@@ -1,0 +1,120 @@
+plugins {
+	alias(libs.plugins.android.application)
+	alias(libs.plugins.kotlin.android)
+}
+
+android {
+	namespace = 'io.filen.app'
+	compileSdk = 35
+
+	buildFeatures {
+		buildConfig = true
+	}
+
+	defaultConfig {
+		applicationId 'io.filen.app'
+		minSdk = 31
+		targetSdk = 35
+		versionCode 1
+		versionName '1.0'
+
+		testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+
+		def getEnvValue = { key, fallback = "" ->
+			def envFile = rootProject.file('.env')
+			def value = fallback
+
+			// First try to read from .env file
+			if (envFile.exists()) {
+				envFile.eachLine { line ->
+					if (line.startsWith("${key}=")) {
+						value = line.substring(key.length() + 1)
+						return true // break out of eachLine
+					}
+				}
+			}
+			if (value != fallback) {
+				return value
+			}
+			return System.getenv(key)
+		}
+
+		buildConfigField("String", "MASTER_KEYS", "${getEnvValue('MASTER_KEYS')}")
+		buildConfigField("String", "EMAIL", "${getEnvValue('EMAIL')}")
+		buildConfigField("String", "PRIVATE_KEY", "${getEnvValue('PRIVATE_KEY')}")
+		buildConfigField("String", "API_KEY", "${getEnvValue('API_KEY')}")
+		buildConfigField("String", "BASE_FOLDER_UUID", "${getEnvValue('BASE_FOLDER_UUID')}")
+		buildConfigField("int", "AUTH_VERSION", "${getEnvValue('AUTH_VERSION')}")
+	}
+
+	buildTypes {
+		release {
+			minifyEnabled false
+			proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+		}
+	}
+	compileOptions {
+		sourceCompatibility JavaVersion.VERSION_11
+		targetCompatibility JavaVersion.VERSION_11
+	}
+	kotlinOptions {
+		jvmTarget = '11'
+	}
+}
+
+dependencies {
+	implementation libs.androidx.core.ktx
+	implementation libs.androidx.appcompat
+	implementation libs.material
+	testImplementation libs.junit
+	androidTestImplementation libs.androidx.junit
+	androidTestImplementation libs.androidx.espresso.core
+}
+
+def crateName = 'filen-mobile-native-cache'
+def libName = 'filen_mobile_native_cache'
+def rustDirPath = "${projectDir}/../../filen-rs"
+def generatedUniffiPath = "${layout.buildDirectory.dir('generated/kotlin/').get().asFile.path}"
+def target = "aarch64-linux-android"
+def targetMap = [
+		"aarch64-linux-android": "arm64-v8a"
+]
+
+
+tasks.register('buildRustLib', Exec) {
+	commandLine 'cargo', 'ndk', '-t', target, 'build', '--release', '-p', "${crateName}"
+	workingDir rustDirPath
+}
+
+def copyLibsTask = tasks.register('copyRustLib', Copy) {
+	dependsOn("buildRustLib")
+	from "${rustDirPath}/target/$target/release/lib${libName}.so"
+	into "${projectDir}/src/main/jniLibs/${targetMap[target]}/"
+}
+
+def uniffiBindgenTask = tasks.register('generateUniffiBindings', Exec) {
+	dependsOn("buildRustLib")
+	project.delete(generatedUniffiPath)
+	commandLine 'cargo', 'run', '--bin', 'uniffi-bindgen', 'generate', '--library', "target/$target/release/lib${libName}.so", '--language', 'kotlin', '--out-dir', generatedUniffiPath, '-n'
+	workingDir rustDirPath
+}
+
+tasks.preBuild.configure {
+	dependsOn.add(copyLibsTask)
+	dependsOn.add(uniffiBindgenTask)
+}
+
+dependencies {
+	implementation 'net.java.dev.jna:jna:5.17.0@aar'
+	implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.4'
+}
+android {
+	sourceSets {
+		main {
+			kotlin {
+				srcDirs += "build/generated/kotlin/uniffi/${libName}"
+			}
+		}
+	}
+}
