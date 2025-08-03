@@ -153,6 +153,49 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		return DocumentsContract.buildDocumentUri(AUTHORITY, documentId)
 	}
 
+	private fun addObjectToRow(
+		row: MatrixCursor.RowBuilder,
+		obj: FfiObject,
+		id: String
+	) {
+		when (obj) {
+			is FfiObject.File -> {
+				val file = obj.v1
+				val meta = file.meta
+				row.add(Document.COLUMN_DOCUMENT_ID, id)
+				row.add(
+					Document.COLUMN_DISPLAY_NAME,
+					meta?.name ?: "CANNOT_DECRYPT_NAME_${file.uuid}"
+				)
+				row.add(Document.COLUMN_SIZE, file.size)
+				row.add(
+					Document.COLUMN_MIME_TYPE,
+					meta?.mime?.ifEmpty { "application/octet-stream" }
+						?: "application/octet-stream")
+				row.add(Document.COLUMN_LAST_MODIFIED, meta?.modified ?: 0L)
+				row.add(Document.COLUMN_FLAGS, getFileFlags(meta?.name ?: ""))
+			}
+
+			is FfiObject.Dir -> {
+				val dir = obj.v1
+				val meta = dir.meta
+				row.add(Document.COLUMN_DOCUMENT_ID, id)
+				row.add(
+					Document.COLUMN_DISPLAY_NAME,
+					meta?.name ?: "CANNOT_DECRYPT_NAME_${dir.uuid}"
+				)
+				row.add(Document.COLUMN_SIZE, 0)
+				row.add(Document.COLUMN_MIME_TYPE, Document.MIME_TYPE_DIR)
+				row.add(Document.COLUMN_LAST_MODIFIED, meta?.created ?: 0L)
+				row.add(Document.COLUMN_FLAGS, getDefaultFolderFlags())
+			}
+
+			is FfiObject.Root -> {
+				addRootRow(row, id)
+			}
+		}
+	}
+
 	override fun queryDocument(
 		documentId: String?,
 		projection: Array<out String>?,
@@ -174,32 +217,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 				throw convertCacheException(e)
 			}
 				?: throw IllegalArgumentException("Document with ID $documentId not found")
-			when (item) {
-				is FfiObject.File -> {
-					val file = item.v1
-					row.add(Document.COLUMN_DOCUMENT_ID, actualId)
-					row.add(Document.COLUMN_DISPLAY_NAME, file.name)
-					row.add(Document.COLUMN_SIZE, file.size)
-					row.add(
-						Document.COLUMN_MIME_TYPE, file.mime.ifEmpty { "application/octet-stream" })
-					row.add(Document.COLUMN_LAST_MODIFIED, file.modified)
-					row.add(Document.COLUMN_FLAGS, getFileFlags(file.name))
-				}
-
-				is FfiObject.Dir -> {
-					val dir = item.v1
-					row.add(Document.COLUMN_DOCUMENT_ID, actualId)
-					row.add(Document.COLUMN_DISPLAY_NAME, dir.name)
-					row.add(Document.COLUMN_SIZE, 0)
-					row.add(Document.COLUMN_MIME_TYPE, Document.MIME_TYPE_DIR)
-					row.add(Document.COLUMN_LAST_MODIFIED, dir.created)
-					row.add(Document.COLUMN_FLAGS, getDefaultFolderFlags())
-				}
-
-				is FfiObject.Root -> {
-					addRootRow(row, actualId)
-				}
-			}
+			addObjectToRow(row, item, actualId)
 		}
 		return result;
 	}
@@ -212,28 +230,17 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		for (item in objects) {
 			val (id, obj) = extractor(item)
 			val row = result.newRow()
+			var convertedObj: FfiObject
 			when (obj) {
 				is FfiNonRootObject.File -> {
-					val file = obj.v1
-					row.add(Document.COLUMN_DOCUMENT_ID, id)
-					row.add(Document.COLUMN_DISPLAY_NAME, file.name)
-					row.add(Document.COLUMN_SIZE, file.size)
-					row.add(
-						Document.COLUMN_MIME_TYPE, file.mime.ifEmpty { "application/octet-stream" })
-					row.add(Document.COLUMN_LAST_MODIFIED, file.modified)
-					row.add(Document.COLUMN_FLAGS, getFileFlags(file.name))
+					convertedObj = FfiObject.File(obj.v1)
 				}
 
 				is FfiNonRootObject.Dir -> {
-					val dir = obj.v1
-					row.add(Document.COLUMN_DOCUMENT_ID, id)
-					row.add(Document.COLUMN_DISPLAY_NAME, dir.name)
-					row.add(Document.COLUMN_SIZE, 0)
-					row.add(Document.COLUMN_MIME_TYPE, Document.MIME_TYPE_DIR)
-					row.add(Document.COLUMN_LAST_MODIFIED, 0)
-					row.add(Document.COLUMN_FLAGS, getDefaultFolderFlags())
+					convertedObj = FfiObject.Dir(obj.v1)
 				}
 			}
+			addObjectToRow(row, convertedObj, id)
 		}
 	}
 
@@ -254,11 +261,11 @@ class FilenDocumentsProvider : DocumentsProvider() {
 			Pair(
 				"$parentDocumentId/" + when (obj) {
 					is FfiNonRootObject.File -> {
-						obj.v1.name
+						obj.v1.meta?.name ?: obj.v1.uuid
 					}
 
 					is FfiNonRootObject.Dir -> {
-						obj.v1.name
+						obj.v1.meta?.name ?: obj.v1.uuid
 					}
 				}, obj
 			)
@@ -733,7 +740,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		}
 			?: throw FileNotFoundException("Document with ID $documentId not found")
 		return when (item) {
-			is FfiObject.File -> item.v1.mime.ifEmpty { "application/octet-stream" }
+			is FfiObject.File -> item.v1.meta?.mime?.ifEmpty { "application/octet-stream" } ?: "application/octet-stream"
 			is FfiObject.Dir -> Document.MIME_TYPE_DIR
 			is FfiObject.Root -> Document.MIME_TYPE_DIR
 		}
