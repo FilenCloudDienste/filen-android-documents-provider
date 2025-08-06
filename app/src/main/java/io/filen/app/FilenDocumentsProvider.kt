@@ -867,7 +867,7 @@ private fun getDocumentProjection(): Array<String> = arrayOf(
 	Document.COLUMN_FLAGS
 )
 
-val IMAGE_EXTENSIONS = arrayOf("png", "jpg", "jpeg", "gif", "webp")
+val IMAGE_EXTENSIONS = arrayOf("png", "jpg", "jpeg", "gif", "webp", "heic", "heif")
 
 private fun getFileFlags(name: String): Int {
 	var flags = getDefaultFileFlags()
