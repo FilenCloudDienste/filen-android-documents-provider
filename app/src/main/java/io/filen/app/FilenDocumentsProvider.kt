@@ -88,7 +88,8 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	}
 
 	override fun onCreate(): Boolean {
-		this.state = initializeClient(context!!.filesDir.path)
+		val filesDir = "${context!!.filesDir.path}/documentsProvider"
+		this.state = initializeClient(filesDir)
 		val manager: Any? = context!!.getSystemService(Context.NOTIFICATION_SERVICE)
 		manager as NotificationManager
 		val channel =

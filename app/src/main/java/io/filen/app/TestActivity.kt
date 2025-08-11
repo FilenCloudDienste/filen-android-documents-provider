@@ -6,14 +6,21 @@ import android.util.Log
 import android.widget.Button
 import android.widget.Switch
 import androidx.appcompat.app.AppCompatActivity
-import org.json.JSONObject
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.Paths
+import java.nio.file.StandardOpenOption
 
 class TestActivity : AppCompatActivity() {
 	override fun onCreate(savedInstanceState: Bundle?) {
 		super.onCreate(savedInstanceState)
 		// write to the file to simulate a user being logged in
 
-		Log.d("TestActivity", "Auth file written with test data to ${filesDir.absolutePath}/auth.json")
+		val path = Paths.get(filesDir.absolutePath, "documentsProvider")
+		Files.createDirectories(path);
+		val authFile = path.resolve("auth.json")
+
+		Log.d("TestActivity", "Auth file written with test data to $authFile")
 
 		// Simple button to open the system file picker, which will show your provider
 		val button = Button(this).apply {
@@ -25,9 +32,9 @@ class TestActivity : AppCompatActivity() {
 			text = "switch state"
 			setOnCheckedChangeListener{_, isChecked ->
 				if (isChecked) {
-					writeAuthFile()
+					writeAuthFile(authFile)
 				} else {
-					clearAuthFile()
+					clearAuthFile(authFile)
 				}
 			}
 		}
@@ -43,9 +50,7 @@ class TestActivity : AppCompatActivity() {
 		startActivityForResult(intent, 1)
 	}
 
-	private fun writeAuthFile() {
-		val authFile = openFileOutput("auth.json", MODE_PRIVATE)
-
+	private fun writeAuthFile(authFile: Path) {
 		val content = """
 		{
 			"providerEnabled": true,
@@ -66,18 +71,16 @@ class TestActivity : AppCompatActivity() {
 			}
 		}
 		""".trimIndent()
-		authFile.write(content.toByteArray())
+		Files.write(authFile, content.toByteArray(), StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
 	}
 
-	private fun clearAuthFile() {
-		val authFile = openFileOutput("auth.json", MODE_PRIVATE)
-
+	private fun clearAuthFile(authFile: Path) {
 		val content = """
 		{
 			"providerEnabled": false,
 			"sdkConfig": null
 		}
 		""".trimIndent()
-		authFile.write(content.toByteArray())
+		Files.write(authFile, content.toByteArray(), StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
 	}
 }
