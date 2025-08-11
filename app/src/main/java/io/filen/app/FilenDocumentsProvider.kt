@@ -47,6 +47,16 @@ const val DIR_UPDATE_INTERVAL = 15_000L // 15 seconds
 const val ROOT_UPDATE_INTERVAL = 60_000L // 1 minute
 
 class FilenDocumentsProvider : DocumentsProvider() {
+
+	companion object {
+		init {
+			System.loadLibrary("filen_mobile_native_cache")
+		}
+
+		@JvmStatic
+		external fun initJavaVM()
+	}
+
 	// very frustrating that this is nullable,
 	// but we cannot initialize it in the constructor because the context is not available yet
 	// thanks android!
@@ -65,6 +75,10 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 	private var notificationManager: NotificationManager? = null
 	private var notificationIdCounter = 0
+
+	init {
+		initJavaVM()
+	}
 
 	private fun initializeClient(filesPath: String): FilenMobileCacheState {
 		return FilenMobileCacheState(
