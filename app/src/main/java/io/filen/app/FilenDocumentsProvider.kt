@@ -40,6 +40,9 @@ import uniffi.filen_mobile_native_cache.CacheException
 import uniffi.filen_mobile_native_cache.ItemType
 import uniffi.filen_mobile_native_cache.SearchQueryArgs
 import uniffi.filen_mobile_native_cache.ThumbnailResult
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.Paths
 import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.Uuid
 
@@ -81,15 +84,16 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	}
 
 	private fun initializeClient(filesPath: String): FilenMobileCacheState {
+		val documentProviderPath = Paths.get(filesPath, "documentsProvider")
+		Files.createDirectories(documentProviderPath);
 		return FilenMobileCacheState(
-			filesPath,
+			"$filesPath/documentsProvider",
 			"$filesPath/auth.json"
 		)
 	}
 
 	override fun onCreate(): Boolean {
-		val filesDir = "${context!!.filesDir.path}/documentsProvider"
-		this.state = initializeClient(filesDir)
+		this.state = initializeClient(context!!.filesDir.absolutePath)
 		val manager: Any? = context!!.getSystemService(Context.NOTIFICATION_SERVICE)
 		manager as NotificationManager
 		val channel =

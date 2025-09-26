@@ -16,9 +16,7 @@ class TestActivity : AppCompatActivity() {
 		super.onCreate(savedInstanceState)
 		// write to the file to simulate a user being logged in
 
-		val path = Paths.get(filesDir.absolutePath, "documentsProvider")
-		Files.createDirectories(path);
-		val authFile = path.resolve("auth.json")
+		val authFile = Paths.get(filesDir.absolutePath,"auth.json")
 
 		Log.d("TestActivity", "Auth file written with test data to $authFile")
 
