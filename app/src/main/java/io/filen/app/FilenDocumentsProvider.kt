@@ -28,12 +28,15 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import uniffi.filen_mobile_native_cache.FfiDir
+import uniffi.filen_mobile_native_cache.FfiFile
 import uniffi.filen_mobile_native_cache.FfiNonRootObject
 import uniffi.filen_mobile_native_cache.FfiObject
 import uniffi.filen_mobile_native_cache.FilenMobileCacheState
 import uniffi.filen_mobile_native_cache.ProgressCallback
 import java.io.File
 import java.io.FileNotFoundException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import uniffi.filen_mobile_native_cache.CacheException
@@ -41,13 +44,30 @@ import uniffi.filen_mobile_native_cache.ItemType
 import uniffi.filen_mobile_native_cache.SearchQueryArgs
 import uniffi.filen_mobile_native_cache.ThumbnailResult
 import java.nio.file.Files
-import java.nio.file.Path
 import java.nio.file.Paths
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.Uuid
 
 const val DIR_UPDATE_INTERVAL = 15_000L // 15 seconds
 const val ROOT_UPDATE_INTERVAL = 60_000L // 1 minute
+
+private val FfiNonRootObject.uuid: String
+	get() = when (this) {
+		is FfiNonRootObject.File -> v1.uuid
+		is FfiNonRootObject.Dir -> v1.uuid
+	}
+
+private val FfiNonRootObject.displayName: String
+	get() = when (this) {
+		is FfiNonRootObject.File -> v1.meta?.name ?: v1.uuid
+		is FfiNonRootObject.Dir -> v1.meta?.name ?: v1.uuid
+	}
+
+private const val TAG = "FilenDocumentsProvider"
+private const val TRANSFERS_CHANNEL = "transfers_channel"
+private const val LAUNCHER_ICON = "ic_launcher"
+private const val ROOT_TITLE = "Filen"
 
 class FilenDocumentsProvider : DocumentsProvider() {
 
@@ -67,21 +87,43 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	private var rootUuid: String? = null
 		get() {
 			if (field != null) return field
-			field = try {
-				state?.rootUuid()
-			} catch (e: CacheException) {
-				throw convertCacheException(e)
-			}
+			field = cache { it.rootUuid() }
 			return field
 		}
 	private val AUTHORITY = "io.filen.app.documentsprovider"
 	private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 	private var notificationManager: NotificationManager? = null
-	private var notificationIdCounter = 0
+	private val notificationIdCounter = AtomicInteger(0)
 
 	init {
 		initJavaVM()
 	}
+
+	// routes synchronous (binder-thread) SDK calls through convertCacheException so a raw
+	// uniffi CacheException never crosses the binder. do NOT use this in async scope.launch
+	// blocks (those must log + notifyChange instead of rethrowing).
+	private inline fun <T> cache(block: (FilenMobileCacheState) -> T): T =
+		try {
+			block(state!!)
+		} catch (e: CacheException) {
+			throw convertCacheException(e)
+		}
+
+	private fun transferNotification(text: String): NotificationCompat.Builder =
+		NotificationCompat.Builder(context!!, TRANSFERS_CHANNEL).apply {
+			setContentTitle(ROOT_TITLE)
+			setContentText(text)
+			setSmallIcon(
+				context!!.resources.getIdentifier(
+					LAUNCHER_ICON,
+					"mipmap",
+					context!!.packageName
+				)
+			)
+			setOngoing(true)
+			setOnlyAlertOnce(true)
+			setProgress(100, 0, false)
+		}
 
 	private fun initializeClient(filesPath: String): FilenMobileCacheState {
 		val documentProviderPath = Paths.get(filesPath, "documentsProvider")
@@ -97,7 +139,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		val manager: Any? = context!!.getSystemService(Context.NOTIFICATION_SERVICE)
 		manager as NotificationManager
 		val channel =
-			NotificationChannel("transfers_channel", "Transfer", NotificationManager.IMPORTANCE_LOW)
+			NotificationChannel(TRANSFERS_CHANNEL, "Transfer", NotificationManager.IMPORTANCE_LOW)
 		manager.createNotificationChannel(channel)
 		notificationManager = manager
 		return true
@@ -106,7 +148,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 
 	override fun queryRoots(projection: Array<out String>?): Cursor {
 		Log.d(
-			"FilenDocumentsProvider",
+			TAG,
 			"Querying roots with projection: ${projection?.joinToString() ?: "null"}"
 		)
 		val result = MatrixCursor(projection ?: getRootProjection())
@@ -131,14 +173,17 @@ class FilenDocumentsProvider : DocumentsProvider() {
 			root.maxStorage - root.storageUsed
 		)
 		row.add(Root.COLUMN_MIME_TYPES, "*/*")
-		row.add(Root.COLUMN_TITLE, "Filen")
+		row.add(Root.COLUMN_TITLE, ROOT_TITLE)
 		// we get this dynamically because doing it at compile time wasn't working
 		// ideally this should instead be R.mipmap.ic_launcher
 		row.add(
 			Root.COLUMN_ICON,
-			context!!.resources.getIdentifier("ic_launcher", "mipmap", context!!.packageName)
+			context!!.resources.getIdentifier(LAUNCHER_ICON, "mipmap", context!!.packageName)
 		)
-		row.add(Root.COLUMN_FLAGS, Root.FLAG_SUPPORTS_CREATE)
+		row.add(
+			Root.COLUMN_FLAGS,
+			Root.FLAG_SUPPORTS_IS_CHILD or Root.FLAG_SUPPORTS_RECENTS or Root.FLAG_SUPPORTS_SEARCH or Root.FLAG_SUPPORTS_CREATE
+		)
 
 		val rootUri = getNotifyURI(root.uuid)
 		result.setNotificationUri(context!!.contentResolver, rootUri)
@@ -152,12 +197,13 @@ class FilenDocumentsProvider : DocumentsProvider() {
 				try {
 					state!!.updateRootsInfo()
 				} catch (e: CacheException) {
-					throw convertCacheException(e)
+					Log.e(TAG, "Error updating roots info", e)
+				} finally {
+					context!!.contentResolver.notifyChange(
+						rootUri,
+						null,
+					)
 				}
-				context!!.contentResolver.notifyChange(
-					rootUri,
-					null,
-				)
 			}
 		}
 
@@ -172,46 +218,55 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		return DocumentsContract.buildDocumentUri(AUTHORITY, documentId)
 	}
 
+	private fun addFileToRow(row: MatrixCursor.RowBuilder, file: FfiFile, id: String) {
+		val meta = file.meta
+		row.add(Document.COLUMN_DOCUMENT_ID, id)
+		row.add(
+			Document.COLUMN_DISPLAY_NAME,
+			meta?.name ?: "CANNOT_DECRYPT_NAME_${file.uuid}"
+		)
+		row.add(Document.COLUMN_SIZE, file.size)
+		row.add(
+			Document.COLUMN_MIME_TYPE,
+			meta?.mime?.ifEmpty { "application/octet-stream" }
+				?: "application/octet-stream")
+		row.add(Document.COLUMN_LAST_MODIFIED, meta?.modified ?: 0L)
+		row.add(Document.COLUMN_FLAGS, getFileFlags(meta?.mime))
+	}
+
+	private fun addDirToRow(row: MatrixCursor.RowBuilder, dir: FfiDir, id: String) {
+		val meta = dir.meta
+		row.add(Document.COLUMN_DOCUMENT_ID, id)
+		row.add(
+			Document.COLUMN_DISPLAY_NAME,
+			meta?.name ?: "CANNOT_DECRYPT_NAME_${dir.uuid}"
+		)
+		row.add(Document.COLUMN_SIZE, 0)
+		row.add(Document.COLUMN_MIME_TYPE, Document.MIME_TYPE_DIR)
+		row.add(Document.COLUMN_LAST_MODIFIED, meta?.created ?: 0L)
+		row.add(Document.COLUMN_FLAGS, getDefaultFolderFlags())
+	}
+
 	private fun addObjectToRow(
 		row: MatrixCursor.RowBuilder,
 		obj: FfiObject,
 		id: String
 	) {
 		when (obj) {
-			is FfiObject.File -> {
-				val file = obj.v1
-				val meta = file.meta
-				row.add(Document.COLUMN_DOCUMENT_ID, id)
-				row.add(
-					Document.COLUMN_DISPLAY_NAME,
-					meta?.name ?: "CANNOT_DECRYPT_NAME_${file.uuid}"
-				)
-				row.add(Document.COLUMN_SIZE, file.size)
-				row.add(
-					Document.COLUMN_MIME_TYPE,
-					meta?.mime?.ifEmpty { "application/octet-stream" }
-						?: "application/octet-stream")
-				row.add(Document.COLUMN_LAST_MODIFIED, meta?.modified ?: 0L)
-				row.add(Document.COLUMN_FLAGS, getFileFlags(meta?.name ?: ""))
-			}
+			is FfiObject.File -> addFileToRow(row, obj.v1, id)
+			is FfiObject.Dir -> addDirToRow(row, obj.v1, id)
+			is FfiObject.Root -> addRootRow(row, id)
+		}
+	}
 
-			is FfiObject.Dir -> {
-				val dir = obj.v1
-				val meta = dir.meta
-				row.add(Document.COLUMN_DOCUMENT_ID, id)
-				row.add(
-					Document.COLUMN_DISPLAY_NAME,
-					meta?.name ?: "CANNOT_DECRYPT_NAME_${dir.uuid}"
-				)
-				row.add(Document.COLUMN_SIZE, 0)
-				row.add(Document.COLUMN_MIME_TYPE, Document.MIME_TYPE_DIR)
-				row.add(Document.COLUMN_LAST_MODIFIED, meta?.created ?: 0L)
-				row.add(Document.COLUMN_FLAGS, getDefaultFolderFlags())
-			}
-
-			is FfiObject.Root -> {
-				addRootRow(row, id)
-			}
+	private fun addNonRootObjectToRow(
+		row: MatrixCursor.RowBuilder,
+		obj: FfiNonRootObject,
+		id: String
+	) {
+		when (obj) {
+			is FfiNonRootObject.File -> addFileToRow(row, obj.v1, id)
+			is FfiNonRootObject.Dir -> addDirToRow(row, obj.v1, id)
 		}
 	}
 
@@ -230,11 +285,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		if (actualId == rootUuid) {
 			addRootRow(row, actualId)
 		} else {
-			val item = try {
-				state!!.queryItem(actualId)
-			} catch (e: CacheException) {
-				throw convertCacheException(e)
-			}
+			val item = cache { it.queryItem(actualId) }
 				?: throw IllegalArgumentException("Document with ID $documentId not found")
 			addObjectToRow(row, item, actualId)
 		}
@@ -249,17 +300,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		for (item in objects) {
 			val (id, obj) = extractor(item)
 			val row = result.newRow()
-			var convertedObj: FfiObject
-			when (obj) {
-				is FfiNonRootObject.File -> {
-					convertedObj = FfiObject.File(obj.v1)
-				}
-
-				is FfiNonRootObject.Dir -> {
-					convertedObj = FfiObject.Dir(obj.v1)
-				}
-			}
-			addObjectToRow(row, convertedObj, id)
+			addNonRootObjectToRow(row, obj, id)
 		}
 	}
 
@@ -270,24 +311,10 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	): Cursor {
 		parentDocumentId!!
 		val result = MatrixCursor(projection ?: getDocumentProjection())
-		val resp = try {
-			state!!.queryDirChildren(parentDocumentId, orderBy) ?: return result
-		} catch (e: CacheException) {
-			throw convertCacheException(e)
-		}
+		val resp = cache { it.queryDirChildren(parentDocumentId, orderBy) } ?: return result
 
 		this.addObjectsToCursor(result, resp.objects, { obj: FfiNonRootObject ->
-			Pair(
-				"$parentDocumentId/" + when (obj) {
-					is FfiNonRootObject.File -> {
-						obj.v1.meta?.name ?: obj.v1.uuid
-					}
-
-					is FfiNonRootObject.Dir -> {
-						obj.v1.meta?.name ?: obj.v1.uuid
-					}
-				}, obj
-			)
+			Pair("$parentDocumentId/" + obj.displayName, obj)
 		})
 
 		val now = System.currentTimeMillis()
@@ -295,7 +322,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		result.setNotificationUri(context!!.contentResolver, notifyUri)
 
 		Log.d(
-			"FilenDocumentsProvider",
+			TAG,
 			"Querying child documents for: $parentDocumentId, lastListed: ${resp.parent.lastListed}, now: $now"
 		)
 		if (now > resp.parent.lastListed + DIR_UPDATE_INTERVAL) {
@@ -305,14 +332,14 @@ class FilenDocumentsProvider : DocumentsProvider() {
 			scope.launch {
 				try {
 					state!!.updateDirChildren(parentDocumentId)
-
 				} catch (e: CacheException) {
-					throw convertCacheException(e)
+					Log.e(TAG, "Error updating dir children for $parentDocumentId", e)
+				} finally {
+					context!!.contentResolver.notifyChange(
+						notifyUri,
+						null,
+					)
 				}
-				context!!.contentResolver.notifyChange(
-					notifyUri,
-					null,
-				)
 			}
 		}
 
@@ -325,7 +352,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		queryArgs: Bundle?,
 		signal: CancellationSignal?
 	): Cursor {
-		Log.d("FilenDocumentsProvider", "query recents")
+		Log.d(TAG, "query recents")
 		val result = MatrixCursor(projection ?: getDocumentProjection())
 
 		val resp = runBlocking {
@@ -345,17 +372,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		}
 
 		this.addObjectsToCursor(result, resp.objects, { obj: FfiNonRootObject ->
-			Pair(
-				"recents/" + when (obj) {
-					is FfiNonRootObject.File -> {
-						obj.v1.uuid
-					}
-
-					is FfiNonRootObject.Dir -> {
-						obj.v1.uuid
-					}
-				}, obj
-			)
+			Pair("recents/" + obj.uuid, obj)
 		})
 
 		return result
@@ -369,19 +386,16 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	): Cursor? {
 		val result = MatrixCursor(projection ?: getDocumentProjection())
 
-		var itemType: ItemType? = null
-
-		var mimeTypes = (queryArgs.getStringArray(DocumentsContract.QUERY_ARG_MIME_TYPES)
-			?: arrayOf()).filter { i ->
-			if (i == Document.MIME_TYPE_DIR) {
-				itemType = ItemType.DIR
-				false
-			} else if (itemType == null) {
-				itemType = ItemType.FILE
-				true
-			} else {
-				true
-			}
+		val requestedMimeTypes = (queryArgs.getStringArray(DocumentsContract.QUERY_ARG_MIME_TYPES)
+			?: arrayOf()).toList()
+		// dirs carry no mime, so the dir request is expressed via itemType, not the mime list
+		val mimeTypes = requestedMimeTypes.filter { it != Document.MIME_TYPE_DIR }
+		// decide itemType from the whole (unordered) set, not from inside the filter:
+		// file mimes present => restrict to files; only dir requested => restrict to dirs; otherwise both
+		val itemType: ItemType? = when {
+			mimeTypes.isNotEmpty() -> ItemType.FILE
+			requestedMimeTypes.contains(Document.MIME_TYPE_DIR) -> ItemType.DIR
+			else -> null
 		}
 
 		val name = (queryArgs.get(DocumentsContract.QUERY_ARG_DISPLAY_NAME) as? String)
@@ -397,11 +411,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 			itemType = itemType
 		)
 
-		val results = try {
-			state!!.querySearch(rustQueryArgs)
-		} catch (e: CacheException) {
-			throw convertCacheException(e)
-		}
+		val results = cache { it.querySearch(rustQueryArgs) }
 
 		this.addObjectsToCursor(result, results, { e ->
 			Pair(e.path, e.`object`)
@@ -419,14 +429,14 @@ class FilenDocumentsProvider : DocumentsProvider() {
 			scope.launch {
 				try {
 					state!!.updateSearch(name)
-
 				} catch (e: CacheException) {
-					throw convertCacheException(e)
+					Log.e(TAG, "Error updating search for $name", e)
+				} finally {
+					context!!.contentResolver.notifyChange(
+						notifyUri,
+						null,
+					)
 				}
-				context!!.contentResolver.notifyChange(
-					notifyUri,
-					null,
-				)
 			}
 		}
 		return result
@@ -435,16 +445,12 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	override fun refresh(
 		uri: Uri?, extras: Bundle?, cancellationSignal: CancellationSignal?
 	): Boolean {
-		Log.d("FilenDocumentsProvider", "Refresh called with uri: $uri")
+		Log.d(TAG, "Refresh called with uri: $uri")
 
 		val path = getDocumentIdFromPath(uri)!!
-		val item = try {
-			state!!.queryItem(getDocumentIdFromPath(uri)!!)
-		} catch (e: CacheException) {
-			throw convertCacheException(e)
-		}
+		val item = cache { it.queryItem(path) }
 		if (item == null) {
-			Log.e("FilenDocumentsProvider", "Item not found for uri: $uri")
+			Log.e(TAG, "Item not found for uri: $uri")
 			return false
 		}
 
@@ -453,12 +459,13 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		when (item) {
 			is FfiObject.Dir -> {
 				job = scope.launch {
-					if (item.v1.lastListed + DIR_UPDATE_INTERVAL < System.currentTimeMillis()) {
-						try {
+					try {
+						if (item.v1.lastListed + DIR_UPDATE_INTERVAL < System.currentTimeMillis()) {
 							state!!.updateDirChildren(item.v1.uuid)
-						} catch (e: CacheException) {
-							throw convertCacheException(e)
 						}
+					} catch (e: CacheException) {
+						Log.e(TAG, "Error refreshing dir ${item.v1.uuid}", e)
+					} finally {
 						context!!.contentResolver.notifyChange(
 							getNotifyURI(item.v1.uuid),
 							null,
@@ -469,35 +476,32 @@ class FilenDocumentsProvider : DocumentsProvider() {
 
 			is FfiObject.Root -> {
 				job = scope.launch {
-					awaitAll(
-						async {
-							if (item.v1.lastListed + DIR_UPDATE_INTERVAL < System.currentTimeMillis()) {
-								try {
+					try {
+						awaitAll(
+							async {
+								if (item.v1.lastListed + DIR_UPDATE_INTERVAL < System.currentTimeMillis()) {
 									state!!.updateDirChildren(item.v1.uuid)
-								} catch (e: CacheException) {
-									throw convertCacheException(e)
 								}
-							}
-						},
-						async {
-							if (item.v1.lastUpdated + ROOT_UPDATE_INTERVAL < System.currentTimeMillis()) {
-								try {
+							},
+							async {
+								if (item.v1.lastUpdated + ROOT_UPDATE_INTERVAL < System.currentTimeMillis()) {
 									state!!.updateRootsInfo()
-								} catch (e: CacheException) {
-									throw convertCacheException(e)
 								}
 							}
-						}
-					)
-					context!!.contentResolver.notifyChange(
-						getNotifyURI(item.v1.uuid),
-						null,
-					)
+						)
+					} catch (e: CacheException) {
+						Log.e(TAG, "Error refreshing root ${item.v1.uuid}", e)
+					} finally {
+						context!!.contentResolver.notifyChange(
+							getNotifyURI(item.v1.uuid),
+							null,
+						)
+					}
 				}
 			}
 
 			is FfiObject.File -> {
-				Log.w("FilenDocumentsProvider", "Tried to refresh file: $path")
+				Log.w(TAG, "Tried to refresh file: $path")
 				return false;
 			}
 		}
@@ -517,26 +521,13 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		val accessMode = ParcelFileDescriptor.parseMode(mode)
 
 		val fd = runBlocking {
-			Log.d("FilenDocumentsProvider", "Opening document: $documentId with mode: $mode")
+			Log.d(TAG, "Opening document: $documentId with mode: $mode")
 			try {
 				signal?.throwIfCanceled()
 
-				val builder = NotificationCompat.Builder(context!!, "transfers_channel").apply {
-					setContentTitle("Filen")
-					setContentText("Downloading")
-					setSmallIcon(
-						context!!.resources.getIdentifier(
-							"ic_launcher",
-							"mipmap",
-							context!!.packageName
-						)
-					)
-					setOngoing(true)
-					setOnlyAlertOnce(true)
-					setProgress(100, 0, false)
-				}
+				val builder = transferNotification("Downloading")
 				val nManager = notificationManager!!
-				val id = notificationIdCounter++
+				val id = notificationIdCounter.getAndIncrement()
 				nManager.notify(id, builder.build())
 
 				// todo, do not download if we only want to write to the file
@@ -570,39 +561,24 @@ class FilenDocumentsProvider : DocumentsProvider() {
 					}
 
 					else -> {
-						Log.d("FilenDocumentsProvider", "Opening file for writing: $documentId")
+						Log.d(TAG, "Opening file for writing: $documentId")
 						// this can be improved because we do not need to download the file if we only want to write to it
 						val handler = Handler(context!!.mainLooper)
 
 						ParcelFileDescriptor.open(file, accessMode, handler, { exception ->
 							Log.d(
-								"FilenDocumentsProvider",
+								TAG,
 								"File opened with exception: $exception"
 							)
 							if (exception != null) {
 								Log.e(
-									"FilenDocumentsProvider",
+									TAG,
 									"Error opening document $documentId: ${exception.message}"
 								)
 							} else {
 								scope.launch {
-									val uploadBuilder =
-										NotificationCompat.Builder(context!!, "transfers_channel")
-											.apply {
-												setContentTitle("Filen")
-												setContentText("Downloading")
-												setSmallIcon(
-													context!!.resources.getIdentifier(
-														"ic_launcher",
-														"mipmap",
-														context!!.packageName
-													)
-												)
-												setOngoing(true)
-												setOnlyAlertOnce(true)
-												setProgress(100, 0, false)
-											}
-									val uploadId = notificationIdCounter++
+									val uploadBuilder = transferNotification("Uploading")
+									val uploadId = notificationIdCounter.getAndIncrement()
 									nManager.notify(uploadId, uploadBuilder.build())
 
 									val updated = try {
@@ -629,12 +605,17 @@ class FilenDocumentsProvider : DocumentsProvider() {
 						})
 					}
 				}
+			} catch (e: CancellationException) {
+				// a CancellationSignal cancels pathJob -> CancellationException; this is a user cancel,
+				// not a missing file, so propagate it unchanged instead of masking it as not-found
+				Log.d(TAG, "Opening document $documentId cancelled")
+				throw e
 			} catch (e: Exception) {
-				Log.e("FilenDocumentsProvider", "Error opening document $documentId: ${e.message}")
+				Log.e(TAG, "Error opening document $documentId: ${e.message}")
 				throw FileNotFoundException("Document not found: $documentId: ${e.message}")
 			}
 		}
-		Log.d("FilenDocumentsProvider", "Opened document: $documentId with fd: $fd")
+		Log.d(TAG, "Opened document: $documentId with fd: $fd")
 		return fd
 	}
 
@@ -684,24 +665,16 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		displayName!!
 		return runBlocking {
 			Log.d(
-				"FilenDocumentsProvider",
+				TAG,
 				"Creating document: $displayName with mimeType: $mimeType in parent: $parentDocumentId"
 			)
 			val documentId: String
 			if (mimeType.equals(Document.MIME_TYPE_DIR, true)) {
 				// Create a new directory
-				documentId = try {
-					state!!.createDir(parentDocumentId, displayName, null).id
-				} catch (e: CacheException) {
-					throw convertCacheException(e)
-				}
+				documentId = cache { it.createDir(parentDocumentId, displayName, null).id }
 			} else {
 				// Create a new file
-				documentId = try {
-					state!!.createEmptyFile(parentDocumentId, displayName, mimeType).id
-				} catch (e: CacheException) {
-					throw convertCacheException(e)
-				}
+				documentId = cache { it.createEmptyFile(parentDocumentId, displayName, mimeType).id }
 			}
 			val parentId =
 				getParentId(documentId)!! // we can assume that the parent is not null because we successfully trashed the item
@@ -720,20 +693,13 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	}
 
 	override fun deleteDocument(documentId: String?) {
+		documentId!!
 		runBlocking {
-			try {
-				state!!.trashItem(documentId!!)
-			} catch (e: CacheException) {
-				throw convertCacheException(e)
-			}
+			cache { it.trashItem(documentId) }
 
 			val parentId =
 				getParentId(documentId)!! // we can assume that the parent is not null because we successfully trashed the item
-			val descendants = try {
-				state!!.getAllDescendantPaths(documentId)
-			} catch (e: CacheException) {
-				throw convertCacheException(e)
-			}
+			val descendants = cache { it.getAllDescendantPaths(documentId) }
 
 			for (descendant in descendants) {
 				revokeDocumentPermission(descendant)
@@ -747,16 +713,15 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	}
 
 	override fun isChildDocument(parentDocumentId: String?, documentId: String?): Boolean {
-		return documentId?.startsWith(parentDocumentId ?: "") ?: false
+		if (documentId == null || parentDocumentId == null) return false
+		// require a path boundary so siblings like "Photos" and "Photos Backup" don't match;
+		// the root parent owns everything beneath it
+		return documentId != parentDocumentId && documentId.startsWith("$parentDocumentId/")
 	}
 
 	override fun getDocumentType(documentId: String?): String {
 		documentId!!
-		val item = try {
-			state!!.queryItem(documentId)
-		} catch (e: CacheException) {
-			throw convertCacheException(e)
-		}
+		val item = cache { it.queryItem(documentId) }
 			?: throw FileNotFoundException("Document with ID $documentId not found")
 		return when (item) {
 			is FfiObject.File -> item.v1.meta?.mime?.ifEmpty { "application/octet-stream" } ?: "application/octet-stream"
@@ -770,14 +735,13 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		sourceParentDocumentId: String?,
 		targetParentDocumentId: String?
 	): String {
+		sourceDocumentId!!
+		sourceParentDocumentId!!
+		targetParentDocumentId!!
 		return runBlocking {
-			val newId = try {
-				state!!.moveItem(sourceDocumentId!!, targetParentDocumentId!!).id
-			} catch (e: CacheException) {
-				throw convertCacheException(e)
-			}
+			val newId = cache { it.moveItem(sourceDocumentId, targetParentDocumentId).id }
 			context!!.contentResolver.notifyChange(
-				getNotifyURI(sourceParentDocumentId!!),
+				getNotifyURI(sourceParentDocumentId),
 				null,
 			)
 			context!!.contentResolver.notifyChange(
@@ -789,12 +753,10 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	}
 
 	override fun renameDocument(documentId: String?, displayName: String?): String? {
+		documentId!!
+		displayName!!
 		return runBlocking {
-			val newId = try {
-				state!!.renameItem(documentId!!, displayName!!)?.id
-			} catch (e: CacheException) {
-				throw convertCacheException(e)
-			}
+			val newId = cache { it.renameItem(documentId, displayName)?.id }
 			context!!.contentResolver.notifyChange(
 				getNotifyURI(getParentId(documentId)!!),
 				null,
@@ -836,7 +798,20 @@ class FilenDocumentsProvider : DocumentsProvider() {
 				FileNotFoundException(error.v1.toString())
 			}
 
-			else -> error
+			is CacheException.InvalidName -> {
+				IllegalArgumentException(error.v1.toString())
+			}
+
+			is CacheException.NotADirectory -> {
+				IllegalArgumentException(error.v1.toString())
+			}
+
+			is CacheException.Unsupported -> {
+				UnsupportedOperationException(error.v1.toString())
+			}
+
+			// defensive: never let a raw uniffi CacheException cross the binder
+			else -> FileNotFoundException(error.message)
 		}
 	}
 
@@ -852,18 +827,20 @@ private fun getDefaultFolderFlags(): Int =
 private fun getDefaultFileFlags(): Int =
 	Document.FLAG_SUPPORTS_RENAME or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_MOVE or Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_REMOVE
 
-private fun getDefaultRootFlags(): Int =
-	Document.FLAG_SUPPORTS_WRITE or Document.FLAG_DIR_SUPPORTS_CREATE or Root.FLAG_SUPPORTS_IS_CHILD or Root.FLAG_SUPPORTS_CREATE or Root.FLAG_SUPPORTS_RECENTS or Root.FLAG_SUPPORTS_SEARCH
+// flags for the root DOCUMENT row (Document.COLUMN_FLAGS) — only Document.* flags belong here.
+// the root is not deletable/renamable/movable; the Root.* capability flags live in queryRoots.
+private fun getRootDocumentFlags(): Int =
+	Document.FLAG_DIR_SUPPORTS_CREATE or Document.FLAG_SUPPORTS_WRITE
 
 private fun addRootRow(
 	row: MatrixCursor.RowBuilder, rootUuid: String
 ) {
 	row.add(Document.COLUMN_DOCUMENT_ID, rootUuid)
-	row.add(Document.COLUMN_DISPLAY_NAME, "Filen")
+	row.add(Document.COLUMN_DISPLAY_NAME, ROOT_TITLE)
 	row.add(Document.COLUMN_SIZE, 0)
 	row.add(Document.COLUMN_MIME_TYPE, Document.MIME_TYPE_DIR)
 	row.add(Document.COLUMN_LAST_MODIFIED, System.currentTimeMillis())
-	row.add(Document.COLUMN_FLAGS, getDefaultRootFlags())
+	row.add(Document.COLUMN_FLAGS, getRootDocumentFlags())
 }
 
 private fun getRootProjection(): Array<String> = arrayOf(
@@ -886,12 +863,10 @@ private fun getDocumentProjection(): Array<String> = arrayOf(
 	Document.COLUMN_FLAGS
 )
 
-val IMAGE_EXTENSIONS = arrayOf("png", "jpg", "jpeg", "gif", "webp", "heic", "heif")
-
-private fun getFileFlags(name: String): Int {
+private fun getFileFlags(mime: String?): Int {
 	var flags = getDefaultFileFlags()
-	val extension = name.lowercase().substringAfterLast(".")
-	if (IMAGE_EXTENSIONS.contains(extension)) {
+	// fall back to no thumbnail flag when the mime is unknown (null/blank)
+	if (mime != null && (mime.startsWith("image") || mime.startsWith("video"))) {
 		flags = flags or Document.FLAG_SUPPORTS_THUMBNAIL
 	}
 	return flags
@@ -903,7 +878,7 @@ private fun getDocumentIdFromPath(path: Uri?): String? {
 	if (fullPath == documentId) {
 		val rootId = fullPath?.removePrefix("/root")
 		if (rootId == fullPath) {
-			Log.e("FilenDocumentsProvider", "Invalid document ID: $fullPath")
+			Log.e(TAG, "Invalid document ID: $fullPath")
 			return null
 		}
 		return rootId
