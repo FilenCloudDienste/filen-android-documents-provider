@@ -26,6 +26,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import uniffi.filen_mobile_native_cache.FfiDir
@@ -42,6 +43,8 @@ import kotlinx.coroutines.cancel
 import uniffi.filen_mobile_native_cache.CacheException
 import uniffi.filen_mobile_native_cache.ItemType
 import uniffi.filen_mobile_native_cache.SearchQueryArgs
+import uniffi.filen_mobile_native_cache.SearchQueryResponseEntry
+import uniffi.filen_mobile_native_cache.SearchUpdateCallback
 import uniffi.filen_mobile_native_cache.ThumbnailResult
 import java.nio.file.Files
 import java.nio.file.Paths
@@ -65,6 +68,11 @@ private val FfiNonRootObject.displayName: String
 	}
 
 private const val TAG = "FilenDocumentsProvider"
+
+// The provider's own cache state authenticates lazily on its first op and is briefly throttled,
+// so the first background search can throw Disabled/AuthenticationRequired; retry past that.
+private const val MAX_SEARCH_REFRESH_ATTEMPTS = 10
+private const val SEARCH_REFRESH_RETRY_DELAY_MS = 1_000L
 private const val TRANSFERS_CHANNEL = "transfers_channel"
 private const val LAUNCHER_ICON = "ic_launcher"
 private const val ROOT_TITLE = "Filen"
@@ -92,6 +100,33 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		}
 	private val AUTHORITY = "io.filen.app.documentsprovider"
 	private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+	// State for the CURRENT live search — one at a time, mirroring the SDK's single live engine
+	// per root (a different query key replaces it). querySearchDocuments returns `results`
+	// synchronously so the binder thread NEVER blocks on the network; refreshSearch fills them in
+	// the background and pings `notifyUri`. Grouping the fields keeps them from drifting apart the
+	// way the old loose @Volatile stash did.
+	private class SearchState(val key: String, notifyUri: Uri) {
+		@Volatile
+		var results: List<SearchQueryResponseEntry> = emptyList()
+		// The observer uri of the MOST RECENT cursor for this search. refreshSearch notifies this
+		// (not a captured stale one), so convergence pings reach whatever cursor the system is
+		// currently watching — every querySearchDocuments mints a fresh uri and repoints here.
+		@Volatile
+		var notifyUri: Uri = notifyUri
+		// True until the first successful querySearch (or we exhaust retries); gates the loading
+		// spinner so a re-query during the auth-warmup retry window keeps it up.
+		@Volatile
+		var loading: Boolean = true
+		// Refresh coalescing (guarded by `searchLock`): at most one querySearch in flight; an update
+		// ping during it sets `pending` and exactly one more refresh runs when it finishes, instead
+		// of unbounded overlapping coroutines on a churning resync.
+		var refreshing: Boolean = false
+		var pending: Boolean = false
+	}
+	@Volatile
+	private var search: SearchState? = null
+	private val searchLock = Any()
 	private var notificationManager: NotificationManager? = null
 	private val notificationIdCounter = AtomicInteger(0)
 
@@ -411,35 +446,149 @@ class FilenDocumentsProvider : DocumentsProvider() {
 			itemType = itemType
 		)
 
-		val results = cache { it.querySearch(rustQueryArgs) }
-
-		this.addObjectsToCursor(result, results, { e ->
-			Pair(e.path, e.`object`)
-		})
-
 		val notifyUri =
 			DocumentsContract.buildSearchDocumentsUri(AUTHORITY, rootId, Uuid.random().toString())
 		result.setNotificationUri(context!!.contentResolver, notifyUri)
 
-		if (name != null) {
-			val extras = Bundle()
-			extras.putBoolean(DocumentsContract.EXTRA_LOADING, true)
-			result.extras = extras
+		// No search term -> nothing to search; return an empty cursor (no background work).
+		if (name == null) {
+			return result
+		}
 
-			scope.launch {
-				try {
-					state!!.updateSearch(name)
-				} catch (e: CacheException) {
-					Log.e(TAG, "Error updating search for $name", e)
-				} finally {
-					context!!.contentResolver.notifyChange(
-						notifyUri,
-						null,
-					)
-				}
+		// One live search at a time. A matching key is a re-query (the system re-reading after a
+		// notifyChange): reuse the stash and just repoint the observer uri at THIS cursor so ongoing
+		// convergence pings reach it. A different key is a fresh search that supersedes the old one.
+		val key = searchKeyOf(rustQueryArgs)
+		val searchState: SearchState
+		val isNewQuery: Boolean
+		val snapResults: List<SearchQueryResponseEntry>
+		val snapLoading: Boolean
+		synchronized(searchLock) {
+			val current = search
+			if (current != null && current.key == key) {
+				current.notifyUri = notifyUri
+				searchState = current
+				isNewQuery = false
+			} else {
+				searchState = SearchState(key, notifyUri)
+				search = searchState
+				isNewQuery = true
+			}
+			// Snapshot results + loading under the SAME lock as the repoint, so the returned rows and
+			// the loading decision stay mutually consistent even if a refreshSearch write lands between
+			// them.
+			snapResults = searchState.results
+			snapLoading = searchState.loading
+		}
+
+		// Return whatever has synced so far synchronously — the binder thread must NEVER block on the
+		// network (create_search validates + resyncs remotely). refreshSearch fills the stash in the
+		// background and notifyChange()s, so the system re-queries and reads the fresher stash. Only a
+		// fresh query launches a refresh, so the notify -> re-query cycle can't loop.
+		this.addObjectsToCursor(result, snapResults, { e -> Pair(e.path, e.`object`) })
+
+		// Loading spinner whenever we still have nothing to show and a fetch is (or will be) running —
+		// evaluated on EVERY query, so a re-query during the retry window keeps it up.
+		if (snapLoading && snapResults.isEmpty()) {
+			result.extras = Bundle().apply {
+				putBoolean(DocumentsContract.EXTRA_LOADING, true)
 			}
 		}
+
+		if (isNewQuery) {
+			scope.launch { refreshSearch(rootId, rustQueryArgs, searchState) }
+		}
 		return result
+	}
+
+	// A stable identity for a search query, so a re-query (notifyChange) is recognised as the same
+	// search and reuses the stash instead of re-launching.
+	private fun searchKeyOf(args: SearchQueryArgs): String =
+		"${args.name}|${args.itemType}|${args.mimeTypes.sorted().joinToString(",")}|" +
+			"${args.fileSizeMin}|${args.lastModifiedMin}|${args.excludeMediaOnDevice}"
+
+	// Runs the actual search OFF the binder thread (Dispatchers.IO): updates the stash and pings
+	// the system. Re-runs itself when the engine reports the results changed (bounded by the
+	// engine's own debounced convergence), and bails if a newer query has superseded this one.
+	private suspend fun refreshSearch(
+		rootId: String,
+		args: SearchQueryArgs,
+		searchState: SearchState
+	) {
+		// Coalesce: at most one refresh cycle in flight per state; a ping during it defers to
+		// `pending` and runs exactly once more when this cycle ends, instead of piling up coroutines.
+		// A cycle that finds itself already superseded still pings its (possibly still-live) observer
+		// so a cursor left mid-load isn't stranded.
+		var superseded = false
+		synchronized(searchLock) {
+			when {
+				search !== searchState -> superseded = true
+				searchState.refreshing -> {
+					searchState.pending = true
+					return
+				}
+				else -> searchState.refreshing = true
+			}
+		}
+		if (superseded) {
+			context?.contentResolver?.notifyChange(searchState.notifyUri, null)
+			return
+		}
+		try {
+			var attempt = 0
+			while (search === searchState && attempt < MAX_SEARCH_REFRESH_ATTEMPTS) {
+				attempt++
+				try {
+					val results = state!!.querySearch(rootId, args, object : SearchUpdateCallback {
+						override fun onUpdate() {
+							// Coalesced relaunch; refreshSearch reads searchState.notifyUri fresh.
+							scope.launch { refreshSearch(rootId, args, searchState) }
+						}
+					})
+					// Commit results + read the CURRENT observer uri under the lock so the write and the
+					// uri can't interleave with a concurrent same-key repoint; notify OUTSIDE the lock.
+					val uri = synchronized(searchLock) {
+						if (search === searchState) {
+							searchState.results = results
+							searchState.loading = false
+							searchState.notifyUri
+						} else {
+							null
+						}
+					}
+					uri?.let { context?.contentResolver?.notifyChange(it, null) }
+					return
+				} catch (e: Exception) {
+					// Disabled/AuthenticationRequired during the provider's auth warmup, or a transient
+					// failure — retry (the state re-reads auth.json after its throttle expires).
+					Log.w(TAG, "Search refresh attempt $attempt for key=${searchState.key} failed, retrying: ${e.message}")
+					delay(SEARCH_REFRESH_RETRY_DELAY_MS)
+				}
+			}
+			// Gave up (or a newer query superseded this one) — clear loading + ping so the spinner stops.
+			val uri = synchronized(searchLock) {
+				if (search === searchState) {
+					searchState.loading = false
+					searchState.notifyUri
+				} else {
+					null
+				}
+			}
+			uri?.let { context?.contentResolver?.notifyChange(it, null) }
+		} finally {
+			val runAgain = synchronized(searchLock) {
+				searchState.refreshing = false
+				if (searchState.pending && search === searchState) {
+					searchState.pending = false
+					true
+				} else {
+					false
+				}
+			}
+			if (runAgain) {
+				scope.launch { refreshSearch(rootId, args, searchState) }
+			}
+		}
 	}
 
 	override fun refresh(
