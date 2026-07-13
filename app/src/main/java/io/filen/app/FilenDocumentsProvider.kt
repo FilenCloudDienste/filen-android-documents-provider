@@ -163,9 +163,13 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	private fun initializeClient(filesPath: String): FilenMobileCacheState {
 		val documentProviderPath = Paths.get(filesPath, "documentsProvider")
 		Files.createDirectories(documentProviderPath);
+		// Unwrap the auth.json DEK from the Android Keystore (same-UID as the app). Missing or failed
+		// unwrap yields an empty key, which makes the Rust decrypt fail -> unauthenticated (fail-closed).
+		val dek = AuthKeystore.loadDek(filesPath) ?: ByteArray(0)
 		return FilenMobileCacheState(
 			"$filesPath/documentsProvider",
-			"$filesPath/auth.json"
+			"$filesPath/auth.json",
+			dek
 		)
 	}
 
