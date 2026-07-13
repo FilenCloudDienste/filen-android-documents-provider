@@ -163,9 +163,20 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	private fun initializeClient(filesPath: String): FilenMobileCacheState {
 		val documentProviderPath = Paths.get(filesPath, "documentsProvider")
 		Files.createDirectories(documentProviderPath);
-		// Unwrap the auth.json DEK from the Android Keystore (same-UID as the app). Missing or failed
-		// unwrap yields an empty key, which makes the Rust decrypt fail -> unauthenticated (fail-closed).
-		val dek = AuthKeystore.loadDek(filesPath) ?: ByteArray(0)
+		// Provision-or-load the auth.json DEK from the Android Keystore (same-UID as the app). The
+		// provider process can be started by the Files app BEFORE the app enables the provider and
+		// provisions the key; since the Rust cache captures the key at construction but re-reads
+		// auth.json on a poll, an absent-then-appearing key would strand the provider unauthenticated
+		// until its process restarts. getOrCreate is idempotent and shares the Keystore alias +
+		// wrapped-blob contract with the app, so a valid, stable key is always present up front and the
+		// poll decrypts as soon as auth.json is written. A no-secure-hardware failure yields an empty
+		// key -> Rust decrypt fails -> unauthenticated (fail-closed).
+		val dek =
+			try {
+				AuthKeystore.getOrCreateDek(filesPath)
+			} catch (e: Exception) {
+				ByteArray(0)
+			}
 		return FilenMobileCacheState(
 			"$filesPath/documentsProvider",
 			"$filesPath/auth.json",
