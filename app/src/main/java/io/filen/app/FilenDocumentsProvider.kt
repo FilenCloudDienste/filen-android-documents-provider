@@ -695,21 +695,24 @@ class FilenDocumentsProvider : DocumentsProvider() {
 				nManager.notify(id, builder.build())
 
 				// todo, do not download if we only want to write to the file
-				val pathJob = async {
-					try {
-						state!!.downloadFileIfChangedByPath(
-							documentId,
-							ProgressNotifier(nManager, builder, id)
-						)
-					} catch (e: CacheException) {
-						throw convertCacheException(e)
+				val path = try {
+					val pathJob = async {
+						try {
+							state!!.downloadFileIfChangedByPath(
+								documentId,
+								ProgressNotifier(nManager, builder, id)
+							)
+						} catch (e: CacheException) {
+							throw convertCacheException(e)
+						}
 					}
-
+					signal?.setOnCancelListener {
+						pathJob.cancel("Download cancelled by caller")
+					}
+					pathJob.await()
+				} finally {
+					nManager.cancel(id)
 				}
-				signal?.setOnCancelListener {
-					pathJob.cancel("Download cancelled by caller")
-				}
-				val path = pathJob.await()
 
 				val file = File(path)
 
@@ -745,24 +748,27 @@ class FilenDocumentsProvider : DocumentsProvider() {
 									val uploadId = notificationIdCounter.getAndIncrement()
 									nManager.notify(uploadId, uploadBuilder.build())
 
-									val updated = try {
-										state!!.uploadFileIfChanged(
-											documentId,
-											ProgressNotifier(nManager, uploadBuilder, uploadId)
-										)
-									} catch (e: CacheException) {
-										throw convertCacheException(e)
-									}
-									if (updated) {
-										context!!.contentResolver.notifyChange(
-											getNotifyURI(documentId),
-											null,
-										)
-									} else {
-										// if the file was not updated, we still want to notify the user that the upload is complete
-										// rust currently doesn't handle this
-										uploadBuilder.setProgress(0, 0, false)
-										nManager.notify(uploadId, uploadBuilder.build())
+									try {
+										val updated = try {
+											state!!.uploadFileIfChanged(
+												documentId,
+												ProgressNotifier(nManager, uploadBuilder, uploadId)
+											)
+										} catch (e: CacheException) {
+											throw convertCacheException(e)
+										}
+										if (updated) {
+											context!!.contentResolver.notifyChange(
+												getNotifyURI(documentId),
+												null,
+											)
+										}
+									} catch (e: Exception) {
+										// async scope: log instead of rethrowing (an unhandled coroutine
+										// exception would kill the provider process)
+										Log.e(TAG, "Upload failed for $documentId: ${e.message}")
+									} finally {
+										nManager.cancel(uploadId)
 									}
 								}
 							}
