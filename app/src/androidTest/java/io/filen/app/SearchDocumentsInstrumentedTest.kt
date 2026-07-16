@@ -13,10 +13,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import uniffi.filen_mobile_native_cache.FilenMobileCacheState
 import java.io.File
-import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
-import java.nio.file.StandardOpenOption
 import kotlin.random.Random
 
 /**
@@ -64,13 +62,13 @@ class SearchDocumentsInstrumentedTest {
 		val ctx = InstrumentationRegistry.getInstrumentation().targetContext
 		val filesDir: File = ctx.filesDir
 		authFile = Paths.get(filesDir.absolutePath, "auth.json")
-		writeAuthFile(authFile)
+		val dek = TestAuth.provision(filesDir.absolutePath, authFile)
 		// The SDK opens native_cache.db under these dirs before creating them, so they must exist
 		// first — for our data-creation state AND for the provider's own state (which was created
 		// at app startup, before auth.json existed, and re-authenticates lazily on its next op).
 		File(filesDir, "documentsProvider").mkdirs()
 		val dataDir = File(filesDir, "searchTestData").apply { mkdirs() }
-		dataState = FilenMobileCacheState(dataDir.absolutePath, authFile.toString())
+		dataState = FilenMobileCacheState(dataDir.absolutePath, authFile.toString(), dek)
 	}
 
 	@Test
@@ -166,35 +164,4 @@ class SearchDocumentsInstrumentedTest {
 		}
 	}
 
-	// Mirrors TestActivity.writeAuthFile: a pre-obtained session injected via BuildConfig, so no
-	// live login and no secrets in the repo.
-	private fun writeAuthFile(path: Path) {
-		val content = """
-		{
-			"providerEnabled": true,
-			"sdkConfig": {
-				"email": "${BuildConfig.EMAIL}",
-				"password": "redacted",
-				"twoFactorCode": "",
-				"masterKeys": ${BuildConfig.MASTER_KEYS},
-				"apiKey": "${BuildConfig.API_KEY}",
-				"publicKey": "",
-				"privateKey": "${BuildConfig.PRIVATE_KEY}",
-				"authVersion": ${BuildConfig.AUTH_VERSION},
-				"baseFolderUUID": "${BuildConfig.BASE_FOLDER_UUID}",
-				"userId": 0,
-				"metadataCache": false,
-				"tmpPath": "",
-				"connectToSocket": false
-			}
-		}
-		""".trimIndent()
-		Files.write(
-			path,
-			content.toByteArray(),
-			StandardOpenOption.WRITE,
-			StandardOpenOption.CREATE,
-			StandardOpenOption.TRUNCATE_EXISTING
-		)
-	}
 }
