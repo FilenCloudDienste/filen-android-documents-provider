@@ -1,6 +1,7 @@
 package io.filen.app
 
 import android.app.AuthenticationRequiredException
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -48,7 +49,6 @@ import uniffi.filen_mobile_native_cache.SearchUpdateCallback
 import uniffi.filen_mobile_native_cache.ThumbnailResult
 import java.nio.file.Files
 import java.nio.file.Paths
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.Uuid
 
@@ -74,6 +74,8 @@ private const val TAG = "FilenDocumentsProvider"
 private const val MAX_SEARCH_REFRESH_ATTEMPTS = 10
 private const val SEARCH_REFRESH_RETRY_DELAY_MS = 1_000L
 private const val TRANSFERS_CHANNEL = "transfers_channel"
+private const val TRANSFERS_GROUP = "io.filen.app.TRANSFERS"
+private const val TRANSFERS_SUMMARY_ID = 0
 private const val LAUNCHER_ICON = "ic_launcher"
 private const val ROOT_TITLE = "Filen"
 
@@ -127,8 +129,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	@Volatile
 	private var search: SearchState? = null
 	private val searchLock = Any()
-	private var notificationManager: NotificationManager? = null
-	private val notificationIdCounter = AtomicInteger(0)
+	private var transferNotifications: TransferNotifications? = null
 
 	init {
 		initJavaVM()
@@ -158,7 +159,21 @@ class FilenDocumentsProvider : DocumentsProvider() {
 			setOngoing(true)
 			setOnlyAlertOnce(true)
 			setProgress(100, 0, false)
+			setGroup(TRANSFERS_GROUP)
 		}
+
+	// Posts a per-transfer notification plus the shared group summary (so concurrent transfers
+	// collapse into one stack in the shade). Returns the notification id + builder for progress
+	// updates; every begin MUST be paired with TransferNotifications.end, normally in a finally.
+	private fun beginTransferNotification(text: String): Pair<Int, NotificationCompat.Builder> {
+		val builder = transferNotification(text)
+		val summary = transferNotification("Transferring files").apply {
+			setProgress(0, 0, false)
+			setGroupSummary(true)
+		}
+		val id = transferNotifications!!.begin(builder.build(), summary.build())
+		return id to builder
+	}
 
 	private fun initializeClient(filesPath: String): FilenMobileCacheState {
 		val documentProviderPath = Paths.get(filesPath, "documentsProvider")
@@ -191,7 +206,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		val channel =
 			NotificationChannel(TRANSFERS_CHANNEL, "Transfer", NotificationManager.IMPORTANCE_LOW)
 		manager.createNotificationChannel(channel)
-		notificationManager = manager
+		transferNotifications = TransferNotifications(manager)
 		return true
 
 	}
@@ -689,10 +704,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 			try {
 				signal?.throwIfCanceled()
 
-				val builder = transferNotification("Downloading")
-				val nManager = notificationManager!!
-				val id = notificationIdCounter.getAndIncrement()
-				nManager.notify(id, builder.build())
+				val (id, builder) = beginTransferNotification("Downloading")
 
 				// todo, do not download if we only want to write to the file
 				val path = try {
@@ -700,7 +712,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 						try {
 							state!!.downloadFileIfChangedByPath(
 								documentId,
-								ProgressNotifier(nManager, builder, id)
+								ProgressNotifier(builder, id, transferNotifications!!::notifyProgress)
 							)
 						} catch (e: CacheException) {
 							throw convertCacheException(e)
@@ -711,7 +723,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 					}
 					pathJob.await()
 				} finally {
-					nManager.cancel(id)
+					transferNotifications!!.end(id)
 				}
 
 				val file = File(path)
@@ -744,15 +756,13 @@ class FilenDocumentsProvider : DocumentsProvider() {
 								)
 							} else {
 								scope.launch {
-									val uploadBuilder = transferNotification("Uploading")
-									val uploadId = notificationIdCounter.getAndIncrement()
-									nManager.notify(uploadId, uploadBuilder.build())
+									val (uploadId, uploadBuilder) = beginTransferNotification("Uploading")
 
 									try {
 										val updated = try {
 											state!!.uploadFileIfChanged(
 												documentId,
-												ProgressNotifier(nManager, uploadBuilder, uploadId)
+												ProgressNotifier(uploadBuilder, uploadId, transferNotifications!!::notifyProgress)
 											)
 										} catch (e: CacheException) {
 											throw convertCacheException(e)
@@ -768,7 +778,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 										// exception would kill the provider process)
 										Log.e(TAG, "Upload failed for $documentId: ${e.message}")
 									} finally {
-										nManager.cancel(uploadId)
+										transferNotifications!!.end(uploadId)
 									}
 								}
 							}
@@ -1066,10 +1076,57 @@ private fun getParentId(documentId: String): String? {
 	}
 }
 
+// Owns every notify/cancel on the transfers channel: the id allocator, the active-id set, and
+// the paired child + summary post/cancel. All state is private and only reachable through
+// synchronized methods, so the lock and the data it guards can't drift apart. Invariant: the
+// summary notification is posted iff at least one per-transfer notification is active, and a
+// transfer finishing while another starts can't cancel the summary out from under a freshly
+// posted child.
+private class TransferNotifications(private val manager: NotificationManager) {
+	// TRANSFERS_SUMMARY_ID is 0, so per-transfer ids start at 1.
+	private var nextId = 1
+	private val activeIds = mutableSetOf<Int>()
+
+	@Synchronized
+	fun begin(child: Notification, summary: Notification): Int {
+		val id = nextId++
+		activeIds.add(id)
+		manager.notify(TRANSFERS_SUMMARY_ID, summary)
+		manager.notify(id, child)
+		return id
+	}
+
+	// Idempotent: ids are never reused, so a second end for the same id is a no-op.
+	@Synchronized
+	fun end(id: Int) {
+		if (!activeIds.remove(id)) {
+			return
+		}
+		manager.cancel(id)
+		if (activeIds.isEmpty()) {
+			manager.cancel(TRANSFERS_SUMMARY_ID)
+		}
+	}
+
+	// Progress updates MUST route through here instead of notifying directly: cancelling the
+	// Kotlin coroutine does not stop the Rust transfer (the uniffi wrapper spawns it on its own
+	// runtime, so cancel merely detaches it), and the detached transfer keeps firing progress
+	// callbacks after end() cancelled the id. An unguarded notify would then re-post the ongoing
+	// notification with nothing left to ever cancel it.
+	@Synchronized
+	fun notifyProgress(id: Int, notification: Notification) {
+		if (id in activeIds) {
+			manager.notify(id, notification)
+		}
+	}
+}
+
 class ProgressNotifier(
-	private val notificationManager: NotificationManager,
 	private var builder: NotificationCompat.Builder,
-	private val notificationId: Int
+	private val notificationId: Int,
+	// TransferNotifications.notifyProgress — drops updates for ended transfers, since the
+	// Rust transfer (and its callbacks) can outlive the coroutine that awaited it
+	private val notify: (Int, Notification) -> Unit
 ) :
 	ProgressCallback {
 	private var maxBytes = 0UL
@@ -1087,7 +1144,7 @@ class ProgressNotifier(
 			Log.d("Notifier", "Notifier $notificationId: $readBytes/$maxBytes bytes processed")
 			builder.setProgress(100, (readBytes * 100UL / maxBytes).toInt(), false)
 		}
-		notificationManager.notify(notificationId, builder.build())
+		notify(notificationId, builder.build())
 	}
 
 	override fun setTotal(size: ULong) {
