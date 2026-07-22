@@ -22,6 +22,7 @@ import android.provider.DocumentsContract.Root
 import android.provider.DocumentsProvider
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -101,7 +102,15 @@ class FilenDocumentsProvider : DocumentsProvider() {
 			return field
 		}
 	private val AUTHORITY = "io.filen.app.documentsprovider"
-	private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+	// Backstop: an exception escaping a fire-and-forget coroutine in this scope would otherwise
+	// reach the default handler and kill the whole app process — a network blip during a
+	// background refresh must never be fatal in a documents provider.
+	private val scope = CoroutineScope(
+		Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e ->
+			Log.e(TAG, "Uncaught exception in provider background scope", e)
+		}
+	)
 
 	// State for the CURRENT live search — one at a time, mirroring the SDK's single live engine
 	// per root (a different query key replaces it). querySearchDocuments returns `results`
@@ -655,21 +664,32 @@ class FilenDocumentsProvider : DocumentsProvider() {
 
 			is FfiObject.Root -> {
 				job = scope.launch {
+					// The catches MUST live inside each async: a failing child async fails the
+					// parent launch through the Job tree before awaitAll rethrows, so an outer
+					// try/catch cannot stop the exception from reaching the process-killing
+					// default handler. The try here exists only for the finally (notify even on
+					// cancellation), never to catch.
 					try {
 						awaitAll(
 							async {
-								if (item.v1.lastListed + DIR_UPDATE_INTERVAL < System.currentTimeMillis()) {
-									state!!.updateDirChildren(item.v1.uuid)
+								try {
+									if (item.v1.lastListed + DIR_UPDATE_INTERVAL < System.currentTimeMillis()) {
+										state!!.updateDirChildren(item.v1.uuid)
+									}
+								} catch (e: CacheException) {
+									Log.e(TAG, "Error refreshing root children ${item.v1.uuid}", e)
 								}
 							},
 							async {
-								if (item.v1.lastUpdated + ROOT_UPDATE_INTERVAL < System.currentTimeMillis()) {
-									state!!.updateRootsInfo()
+								try {
+									if (item.v1.lastUpdated + ROOT_UPDATE_INTERVAL < System.currentTimeMillis()) {
+										state!!.updateRootsInfo()
+									}
+								} catch (e: CacheException) {
+									Log.e(TAG, "Error refreshing roots info", e)
 								}
 							}
 						)
-					} catch (e: CacheException) {
-						Log.e(TAG, "Error refreshing root ${item.v1.uuid}", e)
 					} finally {
 						context!!.contentResolver.notifyChange(
 							getNotifyURI(item.v1.uuid),
