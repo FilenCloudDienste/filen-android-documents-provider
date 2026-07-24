@@ -68,6 +68,18 @@ private val FfiNonRootObject.displayName: String
 		is FfiNonRootObject.Dir -> v1.meta?.name ?: v1.uuid
 	}
 
+// Items are identified by their whole-life id: for files the server-minted
+// stable id (the plain uuid is re-minted on every content edit and version
+// restore), for directories the uuid itself (stable == uuid on the wire, by
+// design). Name paths are never document ids anymore — they went stale on
+// every rename/move. The Rust cache resolves the `stable/` namespace for
+// every operation.
+private fun documentIdFor(obj: FfiNonRootObject): String =
+	when (obj) {
+		is FfiNonRootObject.File -> "stable/" + obj.v1.stableUuid
+		is FfiNonRootObject.Dir -> "stable/" + obj.v1.uuid
+	}
+
 private const val TAG = "FilenDocumentsProvider"
 
 // The provider's own cache state authenticates lazily on its first op and is briefly throttled,
@@ -388,7 +400,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		val resp = cache { it.queryDirChildren(parentDocumentId, orderBy) } ?: return result
 
 		this.addObjectsToCursor(result, resp.objects, { obj: FfiNonRootObject ->
-			Pair("$parentDocumentId/" + obj.displayName, obj)
+			Pair(documentIdFor(obj), obj)
 		})
 
 		val now = System.currentTimeMillis()
@@ -446,7 +458,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		}
 
 		this.addObjectsToCursor(result, resp.objects, { obj: FfiNonRootObject ->
-			Pair("recents/" + obj.uuid, obj)
+			Pair(documentIdFor(obj), obj)
 		})
 
 		return result
@@ -524,7 +536,7 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		// network (create_search validates + resyncs remotely). refreshSearch fills the stash in the
 		// background and notifyChange()s, so the system re-queries and reads the fresher stash. Only a
 		// fresh query launches a refresh, so the notify -> re-query cycle can't loop.
-		this.addObjectsToCursor(result, snapResults, { e -> Pair(e.path, e.`object`) })
+		this.addObjectsToCursor(result, snapResults, { e -> Pair(documentIdFor(e.`object`), e.`object`) })
 
 		// Loading spinner whenever we still have nothing to show and a fetch is (or will be) running —
 		// evaluated on EVERY query, so a re-query during the retry window keeps it up.
@@ -649,13 +661,16 @@ class FilenDocumentsProvider : DocumentsProvider() {
 				job = scope.launch {
 					try {
 						if (item.v1.lastListed + DIR_UPDATE_INTERVAL < System.currentTimeMillis()) {
-							state!!.updateDirChildren(item.v1.uuid)
+							// a bare uuid is not a resolvable id (only the root's is);
+							// the stable namespace addresses any dir by its uuid
+							state!!.updateDirChildren("stable/" + item.v1.uuid)
 						}
 					} catch (e: CacheException) {
 						Log.e(TAG, "Error refreshing dir ${item.v1.uuid}", e)
 					} finally {
+						// notify the id the caller's cursor actually watches
 						context!!.contentResolver.notifyChange(
-							getNotifyURI(item.v1.uuid),
+							getNotifyURI(path),
 							null,
 						)
 					}
@@ -870,17 +885,17 @@ class FilenDocumentsProvider : DocumentsProvider() {
 			)
 			val documentId: String
 			if (mimeType.equals(Document.MIME_TYPE_DIR, true)) {
-				// Create a new directory
-				documentId = cache { it.createDir(parentDocumentId, displayName, null).id }
+				// Create a new directory, identified by its stable id from day one
+				documentId =
+					cache { "stable/" + it.createDir(parentDocumentId, displayName, null).dir.uuid }
 			} else {
-				// Create a new file
-				documentId = cache { it.createEmptyFile(parentDocumentId, displayName, mimeType).id }
+				// Create a new file, identified by its stable id from day one
+				documentId =
+					cache { "stable/" + it.createEmptyFile(parentDocumentId, displayName, mimeType).file.stableUuid }
 			}
-			val parentId =
-				getParentId(documentId)!! // we can assume that the parent is not null because we successfully trashed the item
 
 			context!!.contentResolver.notifyChange(
-				getNotifyURI(parentId),
+				getNotifyURI(parentDocumentId),
 				null,
 			)
 			documentId
@@ -895,28 +910,84 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	override fun deleteDocument(documentId: String?) {
 		documentId!!
 		runBlocking {
-			cache { it.trashItem(documentId) }
-
-			val parentId =
-				getParentId(documentId)!! // we can assume that the parent is not null because we successfully trashed the item
 			val descendants = cache { it.getAllDescendantPaths(documentId) }
+			// grants on descendants were issued under their stable-form ids —
+			// resolve those before the trash retires the paths
+			val descendantStableIds = descendants.mapNotNull { descendant ->
+				val item = try {
+					cache { it.queryItem(descendant) }
+				} catch (e: Exception) {
+					Log.e(TAG, "Failed to resolve descendant $descendant for revocation", e)
+					null
+				}
+				when (item) {
+					is FfiObject.File -> "stable/" + item.v1.stableUuid
+					is FfiObject.Dir -> "stable/" + item.v1.uuid
+					else -> null
+				}
+			}
+			val resp = cache { it.trashItem(documentId) }
 
+			// the id actually granted to other apps is the document id itself
+			// (a stable id for files), so revoke that alongside the
+			// path-form descendants and the descendants' stable-form ids
+			revokeDocumentPermission(documentId)
 			for (descendant in descendants) {
 				revokeDocumentPermission(descendant)
 			}
+			for (stableId in descendantStableIds) {
+				revokeDocumentPermission(stableId)
+			}
 
-			context!!.contentResolver.notifyChange(
-				getNotifyURI(parentId),
-				null,
-			)
+			// a stable file id has no path structure to split a parent out of;
+			// the trash response still carries the original parent
+			val parentNotifyId = notifyIdForContainerOf(resp.`object`)
+				?: getParentId(documentId)
+			if (parentNotifyId != null) {
+				context!!.contentResolver.notifyChange(
+					getNotifyURI(parentNotifyId),
+					null,
+				)
+			}
 		}
+	}
+
+	// The document id of the container an object lives in (its original parent
+	// while trashed), so change notifications land on the same URI the
+	// container's watchers registered under. Containers are directories, whose
+	// stable id IS their uuid — no cache lookup needed. Null when unresolvable.
+	private fun notifyIdForContainerOf(obj: FfiObject): String? {
+		val parentUuid = when (obj) {
+			is FfiObject.File -> obj.v1.originalParent ?: obj.v1.parent
+			is FfiObject.Dir -> obj.v1.originalParent ?: obj.v1.parent
+			is FfiObject.Root -> return null
+		}
+		if (parentUuid == rootUuid) return rootUuid
+		return "stable/$parentUuid"
 	}
 
 	override fun isChildDocument(parentDocumentId: String?, documentId: String?): Boolean {
 		if (documentId == null || parentDocumentId == null) return false
+		// stable ids carry no path structure — resolve both sides to their
+		// canonical name paths before the containment check (the lookup also
+		// accepts a stale pre-migration uuid)
+		val resolvedId = resolveToPath(documentId) ?: return false
+		val resolvedParentId = resolveToPath(parentDocumentId) ?: return false
 		// require a path boundary so siblings like "Photos" and "Photos Backup" don't match;
 		// the root parent owns everything beneath it
-		return documentId != parentDocumentId && documentId.startsWith("$parentDocumentId/")
+		return resolvedId != resolvedParentId && resolvedId.startsWith("$resolvedParentId/")
+	}
+
+	// The canonical name path for a document id: stable-form ids are resolved
+	// through the cache, everything else already is a path.
+	private fun resolveToPath(documentId: String): String? {
+		if (!documentId.startsWith("stable/")) return documentId
+		return try {
+			cache { it.queryPathForUuid(documentId.removePrefix("stable/")) }
+		} catch (e: Exception) {
+			Log.e(TAG, "Failed to resolve stable id $documentId", e)
+			null
+		}
 	}
 
 	override fun getDocumentType(documentId: String?): String {
@@ -939,7 +1010,13 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		sourceParentDocumentId!!
 		targetParentDocumentId!!
 		return runBlocking {
-			val newId = cache { it.moveItem(sourceDocumentId, targetParentDocumentId).id }
+			val resp = cache { it.moveItem(sourceDocumentId, targetParentDocumentId) }
+			// identity survives the move for files and directories alike
+			val newId = when (val obj = resp.`object`) {
+				is FfiObject.File -> "stable/" + obj.v1.stableUuid
+				is FfiObject.Dir -> "stable/" + obj.v1.uuid
+				else -> resp.id
+			}
 			context!!.contentResolver.notifyChange(
 				getNotifyURI(sourceParentDocumentId),
 				null,
@@ -956,11 +1033,21 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		documentId!!
 		displayName!!
 		return runBlocking {
-			val newId = cache { it.renameItem(documentId, displayName)?.id }
-			context!!.contentResolver.notifyChange(
-				getNotifyURI(getParentId(documentId)!!),
-				null,
-			)
+			val resp = cache { it.renameItem(documentId, displayName) }
+			// identity survives the rename for files and directories alike
+			val newId = when (val obj = resp?.`object`) {
+				is FfiObject.File -> "stable/" + obj.v1.stableUuid
+				is FfiObject.Dir -> "stable/" + obj.v1.uuid
+				else -> resp?.id
+			}
+			val parentNotifyId = resp?.`object`?.let { notifyIdForContainerOf(it) }
+				?: getParentId(documentId)
+			if (parentNotifyId != null) {
+				context!!.contentResolver.notifyChange(
+					getNotifyURI(parentNotifyId),
+					null,
+				)
+			}
 			newId
 		}
 	}
