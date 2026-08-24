@@ -11,6 +11,8 @@ import android.content.res.AssetFileDescriptor
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.graphics.Point
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.Uri
 import android.os.Bundle
 import android.os.CancellationSignal
@@ -233,8 +235,64 @@ class FilenDocumentsProvider : DocumentsProvider() {
 			NotificationChannel(TRANSFERS_CHANNEL, "Transfer", NotificationManager.IMPORTANCE_LOW)
 		manager.createNotificationChannel(channel)
 		transferNotifications = TransferNotifications(manager)
+		watchNetworkAvailability()
 		return true
 
+	}
+
+	// Park the live-update socket while Android has this uid off the network, and bring it back
+	// when it is allowed again.
+	//
+	// Browsing in Files.app means the OS considers OUR app background, so it revokes the uid's
+	// network: live sockets are destroyed (the read fails with ECONNABORTED) and the resolver
+	// refuses further lookups for the uid (EAI_NODATA). None of that reaches the Rust layer as
+	// anything but generic IO errors, so the socket cannot tell "the network is gone" from "this
+	// host will not resolve" — it just reconnects once a second until the uid is unblocked, which
+	// is both futile and exactly the battery behaviour the restriction exists to prevent.
+	//
+	// `onBlockedStatusChanged` names the condition directly, so honour it rather than inferring it
+	// from the resulting errors. Observed on a Pixel 9 with Data Saver on: blocked=true arrives
+	// within a second of the provider going background.
+	private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+	private fun watchNetworkAvailability() {
+		val cm = context!!.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+
+		if (cm == null) {
+			// Nothing to honour, so leave the socket to its own reconnect handling.
+			Log.w(TAG, "No ConnectivityManager; not tracking network availability")
+
+			return
+		}
+
+		val callback =
+			object : ConnectivityManager.NetworkCallback() {
+				override fun onAvailable(network: Network) {
+					setLiveUpdates(true, "network available")
+				}
+
+				override fun onLost(network: Network) {
+					setLiveUpdates(false, "network lost")
+				}
+
+				override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
+					setLiveUpdates(!blocked, if (blocked) "uid blocked" else "uid unblocked")
+				}
+			}
+
+		networkCallback = callback
+
+		// Best-effort: if registration fails the socket still works, it just keeps its old
+		// retry-until-allowed behaviour.
+		runCatching { cm.registerDefaultNetworkCallback(callback) }
+			.onFailure { Log.w(TAG, "Could not register network callback", it) }
+	}
+
+	private fun setLiveUpdates(running: Boolean, reason: String) {
+		Log.d(TAG, "Live updates ${if (running) "resuming" else "pausing"}: $reason")
+
+		runCatching { if (running) state?.startLiveUpdates() else state?.stopLiveUpdates() }
+			.onFailure { Log.w(TAG, "Could not ${if (running) "start" else "stop"} live updates", it) }
 	}
 
 	override fun queryRoots(projection: Array<out String>?): Cursor {
