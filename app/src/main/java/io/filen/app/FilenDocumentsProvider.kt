@@ -113,7 +113,12 @@ class FilenDocumentsProvider : DocumentsProvider() {
 			field = cache { it.rootUuid() }
 			return field
 		}
-	private val AUTHORITY = "io.filen.app.documentsprovider"
+	// Derived from the application id rather than hardcoded: a debug build carries an
+	// applicationIdSuffix (io.filen.app.debug), and a literal authority makes it collide with
+	// the release app's provider — INSTALL_FAILED_CONFLICTING_PROVIDER — so the two cannot be
+	// installed side by side on one device. Lazy because the context is not available at
+	// construction, same reason as `state` above.
+	private val AUTHORITY: String by lazy { "${context!!.packageName}.documentsprovider" }
 
 	// Backstop: an exception escaping a fire-and-forget coroutine in this scope would otherwise
 	// reach the default handler and kill the whole app process — a network blip during a
@@ -1054,7 +1059,10 @@ class FilenDocumentsProvider : DocumentsProvider() {
 
 	private fun makeAuthException(core: Throwable): AuthenticationRequiredException {
 		val intent = Intent().apply {
-			setClassName(AUTHORITY, "io.filen.app.MainActivity")
+			// The application id, NOT the authority: setClassName takes a package name, and
+			// passing the authority meant this intent never resolved. The class name stays
+			// literal — an applicationIdSuffix changes the application id, not java packages.
+			setClassName(context!!.packageName, "io.filen.app.MainActivity")
 		}
 
 		val pendingIntent = PendingIntent.getActivity(
