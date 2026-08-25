@@ -379,7 +379,11 @@ class FilenDocumentsProvider : DocumentsProvider() {
 			Document.COLUMN_MIME_TYPE,
 			meta?.mime?.ifEmpty { "application/octet-stream" }
 				?: "application/octet-stream")
-		row.add(Document.COLUMN_LAST_MODIFIED, meta?.modified ?: 0L)
+		// The server's row timestamp is the fallback: it sits outside the encrypted metadata, so
+		// it survives metadata that carries no date of its own or will not decrypt. Without it
+		// those items report the epoch, which the picker renders as 1 Jan 1970 and sorts below
+		// everything else.
+		row.add(Document.COLUMN_LAST_MODIFIED, meta?.modified ?: file.timestamp)
 		row.add(Document.COLUMN_FLAGS, getFileFlags(meta?.mime))
 	}
 
@@ -392,7 +396,9 @@ class FilenDocumentsProvider : DocumentsProvider() {
 		)
 		row.add(Document.COLUMN_SIZE, 0)
 		row.add(Document.COLUMN_MIME_TYPE, Document.MIME_TYPE_DIR)
-		row.add(Document.COLUMN_LAST_MODIFIED, meta?.created ?: 0L)
+		// A directory has no modification date of its own, so its creation date stands in, and
+		// the row timestamp behind that.
+		row.add(Document.COLUMN_LAST_MODIFIED, meta?.created ?: dir.timestamp)
 		row.add(Document.COLUMN_FLAGS, getDefaultFolderFlags())
 	}
 
