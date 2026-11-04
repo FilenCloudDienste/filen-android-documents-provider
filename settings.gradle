@@ -16,6 +16,13 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // rustls-platform-verifier's Kotlin half; the filen-mobile app adds the same repository.
+        maven {
+            url 'https://github.com/rustls/rustls-platform-verifier/raw/maven-archive/android-release-support/maven/'
+            content {
+                includeGroup 'org.rustls'
+            }
+        }
     }
 }
 

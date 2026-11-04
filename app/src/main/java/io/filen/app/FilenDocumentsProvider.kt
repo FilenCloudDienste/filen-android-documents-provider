@@ -94,6 +94,17 @@ private const val TRANSFERS_SUMMARY_ID = 0
 private const val LAUNCHER_ICON = "ic_launcher"
 private const val ROOT_TITLE = "Filen"
 
+// Hands the JVM and an application Context to the platform TLS verifier compiled into
+// libfilen_mobile_native_cache.so (rustls-platform-verifier). That library carries its own copy of the
+// verifier, separate from the app's sdk-rs one, so it needs its own init even in the app's process;
+// until it runs, every connection the cache state makes fails closed. JNI symbol:
+// Java_io_filen_app_FilenProviderTls_nativeInit. The library is loaded by FilenDocumentsProvider's
+// companion object before this is reachable.
+object FilenProviderTls {
+	@JvmStatic
+	external fun nativeInit(context: Context): Boolean
+}
+
 class FilenDocumentsProvider : DocumentsProvider() {
 
 	companion object {
@@ -228,6 +239,17 @@ class FilenDocumentsProvider : DocumentsProvider() {
 	}
 
 	override fun onCreate(): Boolean {
+		// Before the cache state exists: it may connect as soon as it is constructed.
+		val tlsReady =
+			try {
+				FilenProviderTls.nativeInit(context!!.applicationContext)
+			} catch (e: UnsatisfiedLinkError) {
+				Log.e(TAG, "TLS verifier init unavailable", e)
+				false
+			}
+		if (!tlsReady) {
+			Log.e(TAG, "TLS verifier init failed; connections will fail")
+		}
 		this.state = initializeClient(context!!.filesDir.absolutePath)
 		val manager: Any? = context!!.getSystemService(Context.NOTIFICATION_SERVICE)
 		manager as NotificationManager
