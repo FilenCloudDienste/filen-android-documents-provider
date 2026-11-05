@@ -108,8 +108,6 @@ tasks.preBuild.configure {
 dependencies {
 	implementation 'net.java.dev.jna:jna:5.17.0@aar'
 	implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.4'
-	// Must equal the rustls-platform-verifier-android version in ../filen-rs/Cargo.lock.
-	implementation 'org.rustls:rustls-platform-verifier:0.2.0'
 }
 android {
 	sourceSets {
